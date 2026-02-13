@@ -100,6 +100,7 @@ static const I2CDeviceTypeMap sensorTypes{
     {"TMP468", I2CDeviceType{"tmp468", true}},
     {"TMP75", I2CDeviceType{"tmp75", true}},
     {"W83773G", I2CDeviceType{"w83773g", true}},
+    {"GxpTempSensor", I2CDeviceType{"coretemp", false}},
 };
 
 static struct SensorParams getSensorParameters(
@@ -268,6 +269,61 @@ static SensorConfigMap buildSensorConfigMap(
     return configMap;
 }
 
+// Map for platform devices (no Bus/Address), keyed by DeviceName field
+using PlatformSensorConfigMap =
+    boost::container::flat_map<std::string, SensorConfig>;
+
+static PlatformSensorConfigMap buildPlatformSensorConfigMap(
+    const ManagedObjectType& sensorConfigs)
+{
+    PlatformSensorConfigMap configMap;
+    for (const auto& [path, cfgData] : sensorConfigs)
+    {
+        for (const auto& [intf, cfg] : cfgData)
+        {
+            // Only collect configs that have DeviceName but no Bus/Address
+            auto busCfg = cfg.find("Bus");
+            auto addrCfg = cfg.find("Address");
+            if ((busCfg != cfg.end()) && (addrCfg != cfg.end()))
+            {
+                continue;
+            }
+
+            auto deviceNameCfg = cfg.find("DeviceName");
+            if (deviceNameCfg == cfg.end())
+            {
+                continue;
+            }
+
+            auto* devNameStr =
+                std::get_if<std::string>(&deviceNameCfg->second);
+            if (devNameStr == nullptr)
+            {
+                continue;
+            }
+
+            std::vector<std::string> hwmonNames;
+            auto nameCfg = cfg.find("Name");
+            if (nameCfg != cfg.end())
+            {
+                hwmonNames.push_back(
+                    std::get<std::string>(nameCfg->second));
+            }
+
+            SensorConfig val = {path.str, cfgData, intf, cfg, hwmonNames};
+            auto [it, inserted] =
+                configMap.emplace(*devNameStr, std::move(val));
+            if (!inserted)
+            {
+                lg2::error(
+                    "'{PATH}': ignoring duplicate platform device '{DEV}'",
+                    "PATH", path.str, "DEV", *devNameStr);
+            }
+        }
+    }
+    return configMap;
+}
+
 void createSensors(
     boost::asio::io_context& io, sdbusplus::asio::object_server& objectServer,
     boost::container::flat_map<std::string, std::shared_ptr<HwmonTempSensor>>&
@@ -285,6 +341,8 @@ void createSensors(
 
             SensorConfigMap configMap =
                 buildSensorConfigMap(sensorConfigurations);
+            PlatformSensorConfigMap platformConfigMap =
+                buildPlatformSensorConfigMap(sensorConfigurations);
 
             auto devices =
                 instantiateDevices(sensorConfigurations, sensors, sensorTypes);
@@ -340,48 +398,78 @@ void createSensors(
                     deviceName = device.stem();
                 }
 
+                // Try I2C device matching first, fall back to platform
+                // device matching for devices like "c0000130.coretemp"
                 uint64_t bus = 0;
                 uint64_t addr = 0;
-                if (!getDeviceBusAddr(deviceName, bus, addr))
+                SensorConfig* sensorCfg = nullptr;
+                bool isPlatformDevice = false;
+
+                if (getDeviceBusAddr(deviceName, bus, addr))
+                {
+                    auto findSensorCfg = configMap.find({bus, addr});
+                    if (findSensorCfg != configMap.end())
+                    {
+                        sensorCfg = &findSensorCfg->second;
+                    }
+                }
+                else
+                {
+                    // Platform device: match by DeviceName suffix.
+                    // Use the full device filename (not stem) because
+                    // stem() strips the driver suffix from platform
+                    // device names (e.g. "c0000130.coretemp" -> "c0000130")
+                    std::string fullDeviceName = device.filename().string();
+                    for (auto& [devName, cfg] : platformConfigMap)
+                    {
+                        if (fullDeviceName.find(devName) !=
+                            std::string::npos)
+                        {
+                            sensorCfg = &cfg;
+                            isPlatformDevice = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (sensorCfg == nullptr)
                 {
                     continue;
                 }
 
                 auto thisSensorParameters = getSensorParameters(path);
-                auto findSensorCfg = configMap.find({bus, addr});
-                if (findSensorCfg == configMap.end())
-                {
-                    continue;
-                }
 
-                const std::string& interfacePath =
-                    findSensorCfg->second.sensorPath;
-                auto findI2CDev = devices.find(interfacePath);
-
+                const std::string& interfacePath = sensorCfg->sensorPath;
                 std::shared_ptr<I2CDevice> i2cDev;
-                if (findI2CDev != devices.end())
+
+                if (!isPlatformDevice)
                 {
-                    // If we're only looking to activate newly-instantiated i2c
-                    // devices and this sensor's underlying device was already
-                    // there before this call, there's nothing more to do here.
-                    if (activateOnly && !findI2CDev->second.second)
+                    auto findI2CDev = devices.find(interfacePath);
+                    if (findI2CDev != devices.end())
                     {
-                        continue;
+                        // If we're only looking to activate newly-instantiated
+                        // i2c devices and this sensor's underlying device was
+                        // already there before this call, there's nothing more
+                        // to do here.
+                        if (activateOnly && !findI2CDev->second.second)
+                        {
+                            continue;
+                        }
+                        i2cDev = findI2CDev->second.first;
                     }
-                    i2cDev = findI2CDev->second.first;
                 }
 
-                const SensorData& sensorData = findSensorCfg->second.sensorData;
-                std::string sensorType = findSensorCfg->second.interface;
+                const SensorData& sensorData = sensorCfg->sensorData;
+                std::string sensorType = sensorCfg->interface;
                 auto pos = sensorType.find_last_of('.');
                 if (pos != std::string::npos)
                 {
                     sensorType = sensorType.substr(pos + 1);
                 }
                 const SensorBaseConfigMap& baseConfigMap =
-                    findSensorCfg->second.config;
+                    sensorCfg->config;
                 std::vector<std::string>& hwmonName =
-                    findSensorCfg->second.name;
+                    sensorCfg->name;
 
                 // Temperature has "Name", pressure has "Name1"
                 auto findSensorName = baseConfigMap.find("Name");
@@ -539,7 +627,10 @@ void createSensors(
                 }
                 if (hwmonName.empty())
                 {
-                    configMap.erase(findSensorCfg);
+                    if (!isPlatformDevice)
+                    {
+                        configMap.erase({bus, addr});
+                    }
                 }
             }
         });
