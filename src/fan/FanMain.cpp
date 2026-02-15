@@ -412,6 +412,18 @@ void createSensors(
             std::string sensorName =
                 std::get<std::string>(findSensorName->second);
 
+            bool hasTachInput = true;
+            auto findTachInput = baseConfiguration->second.find("TachInput");
+            if (findTachInput != baseConfiguration->second.end())
+            {
+                const auto* ptrTach =
+                    std::get_if<bool>(&findTachInput->second);
+                if (ptrTach != nullptr)
+                {
+                    hasTachInput = *ptrTach;
+                }
+            }
+
             // on rescans, only update sensors we were signaled by
             auto findSensor = tachSensors.find(sensorName);
             if (!firstScan && findSensor != tachSensors.end())
@@ -626,14 +638,20 @@ void createSensors(
 
             enableFanInput(path);
 
-            auto& tachSensor = tachSensors[sensorName];
-            tachSensor = nullptr;
-            tachSensor = std::make_shared<TachSensor>(
-                path.string(), baseType, objectServer, dbusConnection,
-                presenceGpio, redundancy, io, sensorName,
-                std::move(sensorThresholds), *interfacePath, limits, powerState,
-                led);
-            tachSensor->setupRead();
+            // Some fan controllers lack a tachometer and expose raw
+            // PWM duty via fan_input instead of RPM.  Skip TachSensor
+            // for those so only the PwmSensor (0-100 %) is published.
+            if (hasTachInput)
+            {
+                auto& tachSensor = tachSensors[sensorName];
+                tachSensor = nullptr;
+                tachSensor = std::make_shared<TachSensor>(
+                    path.string(), baseType, objectServer, dbusConnection,
+                    presenceGpio, redundancy, io, sensorName,
+                    std::move(sensorThresholds), *interfacePath, limits,
+                    powerState, led);
+                tachSensor->setupRead();
+            }
 
             if (!pwmPath.empty() && std::filesystem::exists(pwmPath) &&
                 (pwmSensors.count(pwmPath) == 0U))
