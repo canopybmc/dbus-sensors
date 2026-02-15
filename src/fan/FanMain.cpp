@@ -14,6 +14,7 @@
 // limitations under the License.
 */
 
+#include "FanFault.hpp"
 #include "PresenceGpio.hpp"
 #include "PwmSensor.hpp"
 #include "TachSensor.hpp"
@@ -35,6 +36,7 @@
 #include <sdbusplus/bus/match.hpp>
 #include <sdbusplus/message.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -280,6 +282,7 @@ void createSensors(
         pwmSensors,
     boost::container::flat_map<std::string, std::weak_ptr<PresenceGpio>>&
         presenceGpios,
+    std::vector<std::shared_ptr<FanFault>>& faultSensors,
     std::shared_ptr<sdbusplus::asio::connection>& dbusConnection,
     const std::shared_ptr<boost::container::flat_set<std::string>>&
         sensorsChanged,
@@ -289,11 +292,13 @@ void createSensors(
         GetSensorConfiguration>(dbusConnection, [&io, &objectServer,
                                                  &tachSensors, &pwmSensors,
                                                  &presenceGpios,
+                                                 &faultSensors,
                                                  &dbusConnection,
                                                  sensorsChanged](
                                                     const ManagedObjectType&
                                                         sensorConfigurations) {
         bool firstScan = sensorsChanged == nullptr;
+        faultSensors.clear();
         std::vector<std::filesystem::path> paths;
         if (!findFiles(std::filesystem::path("/sys/class/hwmon"),
                        R"(fan\d+_input)", paths))
@@ -660,6 +665,20 @@ void createSensors(
                     pwmName, pwmPath, dbusConnection, objectServer,
                     *interfacePath, "Fan", isValueMutable);
             }
+
+            // Monitor fan fault status via hwmon fan*_fault attribute
+            auto faultFile = directory / ("fan" + indexStr + "_fault");
+            if (std::filesystem::exists(faultFile))
+            {
+                std::string invName = sensorName;
+                std::replace(invName.begin(), invName.end(), ' ', '_');
+
+                auto fault = std::make_shared<FanFault>(
+                    io, dbusConnection, faultFile.string(),
+                    "/system/chassis/chassis/" + invName);
+                fault->start();
+                faultSensors.push_back(fault);
+            }
         }
 
         createRedundancySensor(tachSensors, dbusConnection, objectServer);
@@ -685,12 +704,13 @@ int main()
         pwmSensors;
     boost::container::flat_map<std::string, std::weak_ptr<PresenceGpio>>
         presenceGpios;
+    std::vector<std::shared_ptr<FanFault>> faultSensors;
     auto sensorsChanged =
         std::make_shared<boost::container::flat_set<std::string>>();
 
     boost::asio::post(io, [&]() {
         createSensors(io, objectServer, tachSensors, pwmSensors, presenceGpios,
-                      systemBus, nullptr);
+                      faultSensors, systemBus, nullptr);
     });
 
     boost::asio::steady_timer filterTimer(io);
@@ -712,7 +732,8 @@ int main()
                     return;
                 }
                 createSensors(io, objectServer, tachSensors, pwmSensors,
-                              presenceGpios, systemBus, sensorsChanged, 5);
+                              presenceGpios, faultSensors, systemBus,
+                              sensorsChanged, 5);
             });
         };
 

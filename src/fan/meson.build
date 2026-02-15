@@ -4,6 +4,7 @@ endif
 
 executable(
     'fansensor',
+    'FanFault.cpp',
     'FanMain.cpp',
     'PresenceGpio.cpp',
     'TachSensor.cpp',
